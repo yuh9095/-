@@ -85,7 +85,7 @@ jobs:
           PY
           sudo apt-get update
           sudo apt-get install -y erofs-utils kmod unzip lz4 cpio file
-          fsck.erofs --version
+          fsck.erofs -V
           modinfo --version
 
       - name: Checkout matching OnePlus source trees
