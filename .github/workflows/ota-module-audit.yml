@@ -1,0 +1,120 @@
+name: OTA module extraction and source audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      ota_url:
+        description: Direct HTTPS download URL for the OTA ZIP containing boot/vendor_dlkm/system_dlkm images
+        required: true
+        type: string
+      source_ref:
+        description: OnePlus source branch
+        required: true
+        default: oneplus/sm8650_v_15.0.0_oneplus12
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ota-module-audit
+  cancel-in-progress: false
+
+jobs:
+  extract-and-compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout audit repository
+        uses: actions/checkout@v4
+
+      - name: Download OTA and install extraction tools
+        shell: bash
+        env:
+          OTA_URL: ${{ inputs.ota_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/ota work/extracted reports/ota-module-audit
+          case "$OTA_URL" in
+            https://*) ;;
+            *) echo "Only HTTPS OTA URLs are accepted"; exit 2 ;;
+          esac
+          curl --fail --location --retry 3 --retry-delay 2 "$OTA_URL" -o work/ota.zip
+          unzip -q work/ota.zip -d work/ota
+          sudo apt-get update
+          sudo apt-get install -y erofs-utils kmod unzip lz4
+          fsck.erofs --version
+          modinfo --version
+
+      - name: Checkout matching OnePlus source trees
+        uses: actions/checkout@v4
+        with:
+          repository: yuh9095/android_kernel_common_oneplus_sm8650
+          ref: ${{ inputs.source_ref }}
+          path: source-common
+          fetch-depth: 1
+
+      - name: Checkout Qualcomm msm-kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: yuh9095/android_kernel_oneplus_sm8650
+          ref: ${{ inputs.source_ref }}
+          path: source-msm
+          fetch-depth: 1
+
+      - name: Checkout modules and device tree source
+        uses: actions/checkout@v4
+        with:
+          repository: yuh9095/android_kernel_modules_and_devicetree_oneplus_sm8650
+          ref: ${{ inputs.source_ref }}
+          path: source-modules
+          fetch-depth: 1
+
+      - name: Extract DLKM EROFS images
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract_partition() {
+            local partition="$1"
+            local image
+            image="$(find work/ota -type f -name "$partition.img" -print -quit)"
+            if [[ -z "$image" ]]; then
+              echo "Missing $partition.img in OTA ZIP"
+              return 1
+            fi
+            local dest="work/extracted/$partition"
+            mkdir -p "$dest"
+            echo "Extracting $image"
+            fsck.erofs --extract="$dest" "$image"
+          }
+          extract_partition vendor_dlkm
+          extract_partition system_dlkm
+
+      - name: Scan vendor_boot module version clues
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(find work/ota -type f -name 'vendor_boot.img' -print -quit || true)"
+          if [[ -n "$image" ]]; then
+            strings "$image" | grep -E '6\\.[0-9]+\\.[0-9]+-android[0-9]+-[0-9]+|[A-Za-z0-9_./-]+\\.ko' \
+              | sort -u > reports/ota-module-audit/vendor-boot-strings.txt || true
+          else
+            echo "vendor_boot.img not present in supplied OTA archive" > reports/ota-module-audit/vendor-boot-strings.txt
+          fi
+
+      - name: Compare OTA modules with source inventory and symbol CRCs
+        shell: bash
+        env:
+          OTA_EXTRACT: ${{ github.workspace }}/work/extracted
+        run: |
+          set -euo pipefail
+          python3 scripts/analyze_ota_modules.py
+
+      - name: Upload audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ota-module-audit-${{ github.run_number }}
+          path: reports/ota-module-audit/
+          if-no-files-found: warn
+          retention-days: 14
