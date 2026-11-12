@@ -7,6 +7,10 @@ on:
         description: Direct HTTPS download URL for the OTA ZIP containing boot/vendor_dlkm/system_dlkm images
         required: true
         type: string
+      ota_sha256:
+        description: Optional expected SHA-256 of the OTA ZIP
+        required: false
+        type: string
       source_ref:
         description: OnePlus source branch
         required: true
@@ -32,6 +36,7 @@ jobs:
         shell: bash
         env:
           OTA_URL: ${{ inputs.ota_url }}
+          OTA_SHA256: ${{ inputs.ota_sha256 }}
         run: |
           set -euo pipefail
           mkdir -p work/ota work/extracted reports/ota-module-audit
@@ -40,7 +45,27 @@ jobs:
             *) echo "Only HTTPS OTA URLs are accepted"; exit 2 ;;
           esac
           curl --fail --location --retry 3 --retry-delay 2 "$OTA_URL" -o work/ota.zip
-          unzip -q work/ota.zip -d work/ota
+          echo "Downloaded OTA SHA-256:"
+          sha256sum work/ota.zip
+          if [[ -n "$OTA_SHA256" ]]; then
+            echo "$OTA_SHA256  work/ota.zip" | sha256sum --check -
+          fi
+          python3 - <<'PY'
+          import pathlib, zipfile
+          target = pathlib.Path("work/ota")
+          with zipfile.ZipFile("work/ota.zip") as z:
+              for item in z.infolist():
+                  p = pathlib.PurePosixPath(item.filename)
+                  if p.is_absolute() or ".." in p.parts:
+                      raise SystemExit("Unsafe ZIP path: " + item.filename)
+                  if item.is_dir():
+                      continue
+                  dest = target.joinpath(*p.parts)
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  with z.open(item) as src, dest.open("wb") as dst:
+                      while chunk := src.read(1024 * 1024):
+                          dst.write(chunk)
+          PY
           sudo apt-get update
           sudo apt-get install -y erofs-utils kmod unzip lz4 cpio file
           fsck.erofs --version
