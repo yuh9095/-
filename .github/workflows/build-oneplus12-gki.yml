@@ -65,6 +65,18 @@ jobs:
 
           repo sync -c --no-tags -j2 --fail-fast
 
+      - name: Prepare kernel source for build
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm kernel_platform/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
+
+          sed -i 's/ -dirty//g' kernel_platform/common/scripts/setlocalversion
+          sed -i 's/ -dirty//g' kernel_platform/msm-kernel/scripts/setlocalversion
+
       - name: Verify pinned source and Clang
         working-directory: kernel_workspace
         shell: bash
