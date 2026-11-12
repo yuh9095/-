@@ -1,0 +1,115 @@
+name: Inspect stock boot.img kernel config
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_zip:
+        description: Firmware ZIP path inside this repository
+        required: true
+        default: 原版固件/860.zip
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-stock-boot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout firmware repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip python3 file
+
+      - name: Extract firmware ZIP and locate boot.img
+        env:
+          FIRMWARE_ZIP: ${{ inputs.firmware_zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$GITHUB_WORKSPACE/$FIRMWARE_ZIP"
+          mkdir -p work/firmware work/unpacked reports/stock-boot
+          sha256sum "$GITHUB_WORKSPACE/$FIRMWARE_ZIP" | tee reports/stock-boot/firmware-sha256.txt
+          unzip -q "$GITHUB_WORKSPACE/$FIRMWARE_ZIP" -d work/firmware
+          BOOT_IMG="$(find work/firmware -type f -name boot.img -print -quit)"
+          if [[ -z "$BOOT_IMG" ]]; then
+            echo "boot.img was not found inside the firmware ZIP." | tee reports/stock-boot/result.txt
+            echo "Files found:" >> reports/stock-boot/result.txt
+            find work/firmware -maxdepth 4 -type f -printf '%p (%s bytes)\n' >> reports/stock-boot/result.txt
+            exit 1
+          fi
+          cp "$BOOT_IMG" work/boot.img
+          printf 'Found: %s\n' "$BOOT_IMG" | tee reports/stock-boot/result.txt
+          stat -c 'Size: %s bytes' work/boot.img | tee -a reports/stock-boot/result.txt
+          sha256sum work/boot.img | tee reports/stock-boot/boot-sha256.txt
+          file work/boot.img | tee -a reports/stock-boot/result.txt
+
+      - name: Unpack boot image
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg work/mkbootimg
+          python3 work/mkbootimg/unpack_bootimg.py --boot_img work/boot.img --out work/unpacked 2>&1 | tee reports/stock-boot/unpack-log.txt
+          find work/unpacked -maxdepth 2 -type f -printf '%p (%s bytes)\n' | tee reports/stock-boot/unpacked-files.txt
+          KERNEL="$(find work/unpacked -maxdepth 2 -type f \( -name 'kernel' -o -name 'Image' -o -name 'Image.gz' \) -print -quit)"
+          if [[ -z "$KERNEL" ]]; then
+            echo "Could not locate extracted kernel payload." | tee -a reports/stock-boot/result.txt
+            exit 1
+          fi
+          cp "$KERNEL" work/kernel.bin
+          printf 'Kernel payload: %s\n' "$KERNEL" | tee -a reports/stock-boot/result.txt
+          stat -c 'Kernel size: %s bytes' work/kernel.bin | tee -a reports/stock-boot/result.txt
+          sha256sum work/kernel.bin | tee reports/stock-boot/kernel-sha256.txt
+
+      - name: Extract embedded IKCONFIG if present
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import gzip
+          from pathlib import Path
+
+          kernel = Path("work/kernel.bin").read_bytes()
+          start_tag = b"IKCFG_ST"
+          end_tag = b"IKCFG_ED"
+          start = kernel.find(start_tag)
+          end = kernel.find(end_tag, start + len(start_tag)) if start >= 0 else -1
+          report = Path("reports/stock-boot/result.txt")
+
+          with report.open("a") as out:
+              out.write(f"IKCFG_ST offset: {start}\n")
+              out.write(f"IKCFG_ED offset: {end}\n")
+              if start < 0 or end < 0:
+                  out.write("RESULT: No complete embedded IKCONFIG markers found in the extracted kernel payload.\n")
+                  raise SystemExit(0)
+
+              blob = kernel[start + len(start_tag):end]
+              Path("reports/stock-boot/config.gz").write_bytes(blob)
+              try:
+                  config = gzip.decompress(blob)
+              except Exception as exc:
+                  out.write(f"RESULT: Markers found, but gzip decompression failed: {exc}\n")
+                  raise SystemExit(0)
+
+              Path("reports/stock-boot/stock.config").write_bytes(config)
+              out.write(f"RESULT: Embedded config recovered successfully ({len(config)} bytes).\n")
+          PY
+          if [[ -f reports/stock-boot/stock.config ]]; then
+            sha256sum reports/stock-boot/config.gz reports/stock-boot/stock.config | tee reports/stock-boot/config-sha256.txt
+            echo "Config summary:" | tee reports/stock-boot/config-summary.txt
+            grep -E '^(CONFIG_IKCONFIG|CONFIG_IKCONFIG_PROC|CONFIG_LOCALVERSION|CONFIG_ARM64|CONFIG_MODULES)=' reports/stock-boot/stock.config | tee -a reports/stock-boot/config-summary.txt || true
+            wc -l reports/stock-boot/stock.config | tee -a reports/stock-boot/config-summary.txt
+          fi
+
+      - name: Upload stock boot inspection results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-boot-config-inspection-${{ github.run_number }}
+          path: reports/stock-boot/
+          if-no-files-found: warn
+          retention-days: 14
