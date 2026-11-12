@@ -1,0 +1,218 @@
+name: Compare KO SHA-256 with stock OTA
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_zip:
+        description: Path to the original firmware ZIP in this repository
+        required: true
+        default: 原版固件/860.zip
+        type: string
+      build_run_id:
+        description: GitHub Actions run ID containing the compiled kernel artifact
+        required: true
+        default: "43164268587"
+        type: string
+      build_artifact_name:
+        description: Name of the compiled kernel artifact in that run
+        required: true
+        default: OnePlus12-SM8650-GKI-OTA-Comparison-Inputs
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout audit repository
+        uses: actions/checkout@v4
+
+      - name: Install EROFS and archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y erofs-utils unzip python3
+
+      - name: Validate inputs and download compiled build artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FIRMWARE_ZIP: ${{ inputs.firmware_zip }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          BUILD_ARTIFACT_NAME: ${{ inputs.build_artifact_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$GITHUB_WORKSPACE/$FIRMWARE_ZIP"
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          mkdir -p work/build-artifact work/stock reports/ko-sha256
+          gh run download "$BUILD_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$BUILD_ARTIFACT_NAME" \
+            --dir work/build-artifact
+          echo "Firmware: $FIRMWARE_ZIP" | tee reports/ko-sha256/input-info.txt
+          echo "Build run: $BUILD_RUN_ID" | tee -a reports/ko-sha256/input-info.txt
+          echo "Build artifact: $BUILD_ARTIFACT_NAME" | tee -a reports/ko-sha256/input-info.txt
+          du -sh work/build-artifact | tee -a reports/ko-sha256/input-info.txt
+          command -v fsck.erofs
+
+      - name: Extract stock system_dlkm and vendor_dlkm EROFS images
+        env:
+          FIRMWARE_ZIP: ${{ inputs.firmware_zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$GITHUB_WORKSPACE/$FIRMWARE_ZIP"
+          for part in system_dlkm vendor_dlkm; do
+            entry="$(unzip -Z1 "$ZIP" | grep -E "(^|/)${part}\\.img$" | head -n 1 || true)"
+            if [[ -z "$entry" ]]; then
+              echo "Missing ${part}.img in $FIRMWARE_ZIP"
+              exit 1
+            fi
+            unzip -p "$ZIP" "$entry" > "work/stock/${part}.img"
+            mkdir -p "work/stock/${part}"
+            file "work/stock/${part}.img"
+            fsck.erofs --extract="work/stock/${part}" "work/stock/${part}.img"
+            echo "${part}: $entry" >> reports/ko-sha256/input-info.txt
+          done
+
+      - name: Calculate SHA-256 and compare every KO
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv, hashlib, json
+          from collections import defaultdict
+          from pathlib import Path
+
+          build_root = Path("work/build-artifact")
+          stock_roots = {
+              "system_dlkm": Path("work/stock/system_dlkm"),
+              "vendor_dlkm": Path("work/stock/vendor_dlkm"),
+          }
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def partition_for(path):
+              parts = [p.lower() for p in path.parts]
+              for part in ("system_dlkm", "vendor_dlkm"):
+                  if part in parts:
+                      return part
+              return "unclassified"
+
+          stock = defaultdict(lambda: defaultdict(list))
+          for partition, root in stock_roots.items():
+              for p in root.rglob("*.ko"):
+                  stock[partition][p.name].append({
+                      "path": str(p.relative_to(root)),
+                      "sha256": sha256(p),
+                  })
+
+          build = defaultdict(lambda: defaultdict(list))
+          all_build_files = []
+          for p in build_root.rglob("*.ko"):
+              part = partition_for(p.relative_to(build_root))
+              item = {
+                  "path": str(p.relative_to(build_root)),
+                  "sha256": sha256(p),
+              }
+              build[part][p.name].append(item)
+              all_build_files.append((part, p.name, item))
+
+          rows = []
+          summary = {}
+          for partition in ("system_dlkm", "vendor_dlkm"):
+              bmap = build[partition]
+              smap = stock[partition]
+              names = sorted(set(bmap) | set(smap))
+              counts = defaultdict(int)
+              for name in names:
+                  bitems, sitems = bmap.get(name, []), smap.get(name, [])
+                  bh = {x["sha256"] for x in bitems}
+                  sh = {x["sha256"] for x in sitems}
+                  if not bitems:
+                      status = "STOCK_MODULE_NOT_IN_BUILD"
+                  elif not sitems:
+                      status = "BUILD_MODULE_NOT_IN_STOCK"
+                  elif bh & sh:
+                      status = "SHA256_IDENTICAL"
+                  else:
+                      status = "SAME_NAME_DIFFERENT_SHA256"
+                  counts[status] += 1
+                  rows.append({
+                      "partition": partition,
+                      "module": name,
+                      "status": status,
+                      "build_file_count": len(bitems),
+                      "stock_file_count": len(sitems),
+                      "build_sha256": ";".join(sorted(bh)),
+                      "stock_sha256": ";".join(sorted(sh)),
+                      "build_paths": ";".join(x["path"] for x in bitems),
+                      "stock_paths": ";".join(x["path"] for x in sitems),
+                  })
+              summary[partition] = {
+                  "build_ko_files": sum(len(v) for v in bmap.values()),
+                  "build_unique_module_names": len(bmap),
+                  "stock_ko_files": sum(len(v) for v in smap.values()),
+                  "stock_unique_module_names": len(smap),
+                  "module_name_status_counts": dict(counts),
+              }
+
+          unclassified = []
+          for part, name, item in all_build_files:
+              if part == "unclassified":
+                  unclassified.append({
+                      "module": name, "sha256": item["sha256"], "build_path": item["path"]
+                  })
+
+          out = Path("reports/ko-sha256")
+          out.mkdir(parents=True, exist_ok=True)
+          with (out / "module-comparison.csv").open("w", newline="") as f:
+              fields = ["partition", "module", "status", "build_file_count",
+                        "stock_file_count", "build_sha256", "stock_sha256",
+                        "build_paths", "stock_paths"]
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader()
+              w.writerows(rows)
+
+          with (out / "unclassified-build-modules.csv").open("w", newline="") as f:
+              fields = ["module", "sha256", "build_path"]
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader()
+              w.writerows(unclassified)
+
+          (out / "summary.json").write_text(json.dumps({
+              "method": "SHA-256 of each .ko file; module names grouped within each DLKM partition",
+              "build_artifact_ko_files_total": len(all_build_files),
+              "unclassified_build_ko_files": len(unclassified),
+              "partitions": summary,
+          }, indent=2) + "\n")
+
+          with (out / "summary.md").open("w") as f:
+              f.write("# KO SHA-256 comparison\n\n")
+              f.write("A module is SHA256_IDENTICAL only when at least one built file and one stock OTA file with the same module name have exactly the same SHA-256. Same filename alone is not a match.\n\n")
+              f.write("| Partition | Build KO files / names | Stock KO files / names | Result counts (unique names) |\n")
+              f.write("|---|---:|---:|---|\n")
+              for part, s in summary.items():
+                  f.write(f"| {part} | {s['build_ko_files']} / {s['build_unique_module_names']} | {s['stock_ko_files']} / {s['stock_unique_module_names']} | {json.dumps(s['module_name_status_counts'], ensure_ascii=False)} |\n")
+              f.write(f"\nUnclassified build KO files: {len(unclassified)}. See unclassified-build-modules.csv.\n")
+              f.write("\nFull per-module hashes and paths: module-comparison.csv.\n")
+
+          print((out / "summary.md").read_text())
+          PY
+
+      - name: Upload SHA-256 comparison report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus12-ko-sha256-comparison-${{ github.run_number }}
+          path: reports/ko-sha256/
+          if-no-files-found: warn
+          retention-days: 14
