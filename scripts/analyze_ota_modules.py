@@ -62,6 +62,15 @@ for root in SRC_ROOTS:
         except Exception:
             pass
 
+# Build one recursive source-file index instead of walking every repository once
+# for every OTA module. norm() makes hyphen/underscore module names comparable.
+source_file_index = {}
+for root in SRC_ROOTS:
+    if root.exists():
+        for candidate in root.rglob("*"):
+            if candidate.is_file() and candidate.suffix in (".c", ".S", ".s", ".h"):
+                source_file_index.setdefault(norm(candidate.stem), []).append(candidate)
+
 rows = []
 for p in sorted(ota_modules):
     name = modinfo(p, "name") or p.stem
@@ -69,17 +78,8 @@ for p in sorted(ota_modules):
     signer, srcversion = modinfo(p, "signer"), modinfo(p, "srcversion")
     key = norm(p.stem)
     candidates = source_ko.get(key, [])
-    # Search actual source files recursively. The previous implementation only
-    # checked <repo-root>/<module>.c and extensionless files, missing nested drivers.
-    source_candidates = []
-    stem_variants = {p.stem, p.stem.replace("-", "_"), p.stem.replace("_", "-")}
-    for root in SRC_ROOTS:
-        if not root.exists():
-            continue
-        for stem in stem_variants:
-            for suffix in (".c", ".S", ".s", ".h"):
-                source_candidates.extend(root.rglob(stem + suffix))
-    source_candidates = sorted(set(source_candidates))
+    # Exact-basename matches are hints only; composite/generated modules may differ.
+    source_candidates = sorted(source_file_index.get(key, []))
     if candidates:
         source_status = "BUILT_KO_FOUND"
     elif key in source_targets:
@@ -94,7 +94,6 @@ for p in sorted(ota_modules):
     copied.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(p, copied)
     digest = hashlib.sha256(p.read_bytes()).hexdigest()
-    # Exact-basename matches are hints only; composite/generated modules may differ.
     imported = parse_modversions(p)
     missing, mismatch = [], []
     for symbol, crc in imported.items():
