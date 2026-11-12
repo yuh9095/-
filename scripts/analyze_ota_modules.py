@@ -75,6 +75,24 @@ for p in sorted(ota_modules):
         source_status = "MODULES_ORDER_TARGET_FOUND"
     else:
         source_status = "NO_BUILT_KO_OR_MODULES_ORDER_ENTRY"
+    # Keep the actual OTA binary in the workflow artifact for independent inspection.
+    rel = p.relative_to(OTA)
+    copied = EXTRACTED_OUT / rel
+    copied.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(p, copied)
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    # Find source files whose basename matches the module stem. This is a clue only:
+    # composite modules and generated objects often have different names.
+    source_candidates = []
+    for root in SRC_ROOTS:
+        if root.exists():
+            for suffix in (".c", ".S", ".s", ".h"):
+                candidate = root / (p.stem + suffix)
+                if candidate.is_file():
+                    source_candidates.append(str(candidate.relative_to(ROOT)))
+            for candidate in root.rglob(p.stem):
+                if candidate.is_file():
+                    source_candidates.append(str(candidate.relative_to(ROOT)))
     imported = parse_modversions(p)
     missing, mismatch = [], []
     for symbol, crc in imported.items():
@@ -95,6 +113,9 @@ for p in sorted(ota_modules):
         "signer": signer, "srcversion": srcversion,
         "source_status": source_status,
         "source_ko_candidates": ";".join(str(x.relative_to(ROOT)) for x in candidates),
+        "source_file_candidates": ";".join(sorted(set(source_candidates))[:50]),
+        "extracted_copy": str(copied.relative_to(OUT)),
+        "sha256": digest,
         "imported_symbol_count": len(imported), "crc_status": crc_status,
         "missing_source_exports": ";".join(missing),
         "crc_mismatches": ";".join(mismatch),
@@ -103,7 +124,7 @@ for p in sorted(ota_modules):
 csv_path = OUT / "module-comparison.csv"
 fields = list(rows[0].keys()) if rows else [
     "partition_path","file","module_name","vermagic","depends","signer","srcversion",
-    "source_status","source_ko_candidates","imported_symbol_count","crc_status",
+    "source_status","source_ko_candidates","source_file_candidates","extracted_copy","sha256","imported_symbol_count","crc_status",
     "missing_source_exports","crc_mismatches"]
 with csv_path.open("w", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=fields)
@@ -131,6 +152,8 @@ for k, v in sorted(crc_counts.items()):
 report += [
     "", "## Interpretation cautions", "",
     "- NO_BUILT_KO_OR_MODULES_ORDER_ENTRY is a source-inventory warning, not proof that the driver source is absent. A source tree may require configuration and a build to generate modules.order or .ko files.",
+    "- source_file_candidates are exact-basename hints only; composite modules and generated modules can have different source filenames.",
+    "- Extracted .ko files are included under extracted-modules/ in this workflow artifact.",
     "- CRC comparison is meaningful only when Module.symvers belongs to the exact kernel configuration/build ABI used for the OTA.",
     "- A matching filename does not prove identical module contents. Compare vermagic, imported symbol CRCs, signer and srcversion as well.",
     "- This workflow audits vendor_dlkm and system_dlkm EROFS contents and attempts to unpack vendor_boot ramdisk fragments. If a ramdisk compression format is unsupported, its modules will not appear in the extracted inventory.",
