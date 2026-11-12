@@ -42,7 +42,7 @@ jobs:
           curl --fail --location --retry 3 --retry-delay 2 "$OTA_URL" -o work/ota.zip
           unzip -q work/ota.zip -d work/ota
           sudo apt-get update
-          sudo apt-get install -y erofs-utils kmod unzip lz4
+          sudo apt-get install -y erofs-utils kmod unzip lz4 cpio file
           fsck.erofs --version
           modinfo --version
 
@@ -89,18 +89,6 @@ jobs:
           }
           extract_partition vendor_dlkm
           extract_partition system_dlkm
-
-      - name: Scan vendor_boot module version clues
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="$(find work/ota -type f -name 'vendor_boot.img' -print -quit || true)"
-          if [[ -n "$image" ]]; then
-            strings "$image" | grep -E '6\\.[0-9]+\\.[0-9]+-android[0-9]+-[0-9]+|[A-Za-z0-9_./-]+\\.ko' \
-              | sort -u > reports/ota-module-audit/vendor-boot-strings.txt || true
-          else
-            echo "vendor_boot.img not present in supplied OTA archive" > reports/ota-module-audit/vendor-boot-strings.txt
-          fi
 
       - name: Compare OTA modules with source inventory and symbol CRCs
         shell: bash
