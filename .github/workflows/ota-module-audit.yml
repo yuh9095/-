@@ -3,9 +3,14 @@ name: OTA module extraction and source audit
 on:
   workflow_dispatch:
     inputs:
+      ota_path:
+        description: OTA ZIP path inside this repository
+        required: false
+        default: 原版固件/860.zip
+        type: string
       ota_url:
-        description: Direct HTTPS download URL for the OTA ZIP containing boot/vendor_dlkm/system_dlkm images
-        required: true
+        description: Optional direct HTTPS OTA URL (overrides ota_path)
+        required: false
         type: string
       ota_sha256:
         description: Optional expected SHA-256 of the OTA ZIP
@@ -36,15 +41,27 @@ jobs:
         shell: bash
         env:
           OTA_URL: ${{ inputs.ota_url }}
+          OTA_PATH: ${{ inputs.ota_path }}
           OTA_SHA256: ${{ inputs.ota_sha256 }}
         run: |
           set -euo pipefail
           mkdir -p work/ota work/extracted reports/ota-module-audit
-          case "$OTA_URL" in
-            https://*) ;;
-            *) echo "Only HTTPS OTA URLs are accepted"; exit 2 ;;
-          esac
-          curl --fail --location --retry 3 --retry-delay 2 "$OTA_URL" -o work/ota.zip
+          if [[ -n "$OTA_URL" ]]; then
+            case "$OTA_URL" in
+              https://*) ;;
+              *) echo "Only HTTPS OTA URLs are accepted"; exit 2 ;;
+            esac
+            curl --fail --location --retry 3 --retry-delay 2 "$OTA_URL" -o work/ota.zip
+          else
+            case "$OTA_PATH" in
+              ""|/*|..|../*|*/../*|*/..) echo "Unsafe or empty OTA_PATH"; exit 2 ;;
+            esac
+            if [[ ! -f "$GITHUB_WORKSPACE/$OTA_PATH" ]]; then
+              echo "OTA file not found in repository: $OTA_PATH"
+              exit 2
+            fi
+            cp "$GITHUB_WORKSPACE/$OTA_PATH" work/ota.zip
+          fi
           echo "Downloaded OTA SHA-256:"
           sha256sum work/ota.zip
           if [[ -n "$OTA_SHA256" ]]; then
