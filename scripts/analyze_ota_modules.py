@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import csv, json, os, re, subprocess
+import csv, hashlib, json, os, re, shutil, subprocess
 from pathlib import Path
 
 ROOT = Path(os.environ.get("GITHUB_WORKSPACE", ".")).resolve()
@@ -33,7 +33,11 @@ def parse_modversions(path):
     return found
 
 ota_modules = [p for p in OTA.rglob("*.ko") if p.is_file()]
+EXTRACTED_OUT = OUT / "extracted-modules"
+EXTRACTED_OUT.mkdir(parents=True, exist_ok=True)
 source_ko, source_targets, symvers, source_counts = {}, set(), {}, {}
+source_file_candidates = {}
+
 for root in SRC_ROOTS:
     if not root.exists():
         continue
