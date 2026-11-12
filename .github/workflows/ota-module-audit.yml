@@ -90,6 +90,36 @@ jobs:
           extract_partition vendor_dlkm
           extract_partition system_dlkm
 
+      - name: Unpack vendor_boot ramdisk fragments
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(find work/ota -type f -name 'vendor_boot.img' -print -quit || true)"
+          if [[ -z "$image" ]]; then
+            echo "vendor_boot.img not present; skipping ramdisk extraction"
+            exit 0
+          fi
+          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg work/mkbootimg
+          mkdir -p work/vendor_boot_unpacked work/extracted/vendor_boot_ramdisk
+          python3 work/mkbootimg/unpack_bootimg.py --boot_img "$image" --out work/vendor_boot_unpacked
+          index=0
+          while IFS= read -r -d '' ramdisk; do
+            [[ -s "$ramdisk" ]] || continue
+            tmp="$RUNNER_TEMP/vendor_ramdisk_${index}.cpio"
+            dest="work/extracted/vendor_boot_ramdisk/fragment_${index}"
+            mkdir -p "$dest"
+            if lz4 -t "$ramdisk" >/dev/null 2>&1; then
+              lz4 -d -f "$ramdisk" "$tmp"
+            elif gzip -t "$ramdisk" >/dev/null 2>&1; then
+              gzip -dc "$ramdisk" > "$tmp"
+            else
+              cp "$ramdisk" "$tmp"
+            fi
+            (cd "$dest" && cpio -idm --no-absolute-filenames < "$tmp")
+            index=$((index + 1))
+          done < <(find work/vendor_boot_unpacked -type f -iname '*ramdisk*' -print0)
+          echo "Unpacked $index vendor ramdisk fragment(s)"
+
       - name: Compare OTA modules with source inventory and symbol CRCs
         shell: bash
         env:
