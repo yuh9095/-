@@ -1,0 +1,167 @@
+name: Build OnePlus 12 OPLUS Module
+
+on:
+  workflow_dispatch:
+    inputs:
+      module_path:
+        description: "Module source path (file ending in .ko, or an OPLUS module directory)"
+        required: true
+        default: "vendor/oplus/kernel/cpu/game_opt"
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-oneplus12-oplus-module.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oneplus12-sm8650-oplus-module
+  cancel-in-progress: false
+
+jobs:
+  build-module:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MODULE_PATH: ${{ github.event.inputs.module_path || 'vendor/oplus/kernel/cpu/game_opt' }}
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+
+      - name: Checkout audit repository
+        uses: actions/checkout@v4
+        with:
+          path: audit
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl python3 python-is-python3 \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev \
+            zip unzip rsync cpio \
+            device-tree-compiler zstd lz4
+
+      - name: Install repo tool
+        run: |
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o repo
+          chmod +x repo
+          sudo install repo /usr/local/bin/repo
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "OnePlus Kernel Build"
+          git config --global user.email "kernel-build@users.noreply.github.com"
+
+      - name: Sync official OnePlus 12 source
+        run: |
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+          repo init \
+            -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b oneplus/sm8650 \
+            -m oneplus_12_v.xml \
+            --depth=1
+          repo sync -c --no-tags -j2 --fail-fast
+
+      - name: Prepare kernel source
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm kernel_platform/common/android/abi_gki_protected_exports_* || echo "No common protected exports"
+          rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || echo "No msm protected exports"
+          sed -i 's/ -dirty//g' kernel_platform/common/scripts/setlocalversion
+          sed -i 's/ -dirty//g' kernel_platform/msm-kernel/scripts/setlocalversion
+          test -x kernel_platform/tools/bazel
+          test -f kernel_platform/oplus/build/oplus_build_module.sh
+          test -f kernel_platform/oplus/build/oplus_setup.sh
+
+      - name: Verify compiler and module target
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -Fx 'CLANG_VERSION=r487747c' kernel_platform/msm-kernel/build.config.constants
+          CLANG="$(find kernel_platform/prebuilts/clang/host/linux-x86 -type f -path '*/clang-r487747c/bin/clang' -print -quit)"
+          test -n "$CLANG"
+          "$CLANG" --version
+          echo "Requested module path: $MODULE_PATH"
+          if [[ "$MODULE_PATH" == *.ko ]]; then
+            test -f "$MODULE_PATH"
+          else
+            test -d "$MODULE_PATH"
+          fi
+          {
+            echo "Manifest: OnePlusOSS/kernel_manifest"
+            echo "Manifest branch: oneplus/sm8650"
+            echo "Manifest file: oneplus_12_v.xml"
+            echo "Target: pineapple gki"
+            echo "Build script: kernel_platform/oplus/build/oplus_build_module.sh"
+            echo "Module path: $MODULE_PATH"
+            echo "Pinned Clang: r487747c"
+            echo
+            repo manifest -r
+            echo
+            repo forall -c 'printf "%s %s %s\\n" "$REPO_PATH" "$REPO_PROJECT" "$(git rev-parse HEAD)"'
+          } > ../audit/module-build-metadata.txt
+
+      - name: Build OPLUS module with official helper
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SCRIPT="./kernel_platform/oplus/build/oplus_build_module.sh"
+          test -f "$SCRIPT"
+          printf '%s\n' "$MODULE_PATH" | bash "$SCRIPT" pineapple gki 2>&1 | tee ../audit/module-build.log
+
+      - name: Verify and collect module outputs
+        if: always()
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set +e
+          mkdir -p ../audit/module-artifacts
+          for dir in \
+            device/qcom/pineapple-kernel \
+            kernel_platform/out/msm-kernel-pineapple-gki/dist \
+            kernel_platform/out/vendor/oplus/kernel/cpu/game_opt; do
+            if [ -d "$dir" ]; then
+              mkdir -p "../audit/module-artifacts/$dir"
+              cp -a "$dir"/. "../audit/module-artifacts/$dir"/ 2>/dev/null
+            fi
+          done
+          cp ../audit/module-build.log ../audit/module-artifacts/ 2>/dev/null
+          cp ../audit/module-build-metadata.txt ../audit/module-artifacts/ 2>/dev/null
+          find ../audit/module-artifacts -type f -name '*.ko' -print
+          KO_COUNT="$(find ../audit/module-artifacts -type f -name '*.ko' | wc -l)"
+          echo "Collected KO count: $KO_COUNT"
+          if [ "$KO_COUNT" -eq 0 ]; then
+            echo "ERROR: no .ko output was produced or collected."
+            exit 1
+          fi
+
+      - name: Upload OPLUS module build outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePlus12-OPLUS-Module-Build
+          path: |
+            audit/module-build.log
+            audit/module-build-metadata.txt
+            audit/module-artifacts/
+          if-no-files-found: warn
+          compression-level: 1
+          retention-days: 14
