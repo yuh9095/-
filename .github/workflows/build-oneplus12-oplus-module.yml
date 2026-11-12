@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       module_path:
-        description: "Module source path (file ending in .ko, or an OPLUS module directory)"
-        required: true
-        default: "vendor/oplus/kernel/cpu/game_opt"
+        description: "Leave empty to test the helper with no module path (stdin closed); otherwise enter a .ko path or OPLUS module directory"
+        required: false
+        default: ""
         type: string
   push:
     branches:
@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      MODULE_PATH: ${{ github.event.inputs.module_path || 'vendor/oplus/kernel/cpu/game_opt' }}
+      MODULE_PATH: ${{ github.event.inputs.module_path || '' }}
 
     steps:
       - name: Maximize build space
@@ -98,11 +98,15 @@ jobs:
           CLANG="$(find kernel_platform/prebuilts/clang/host/linux-x86 -type f -path '*/clang-r487747c/bin/clang' -print -quit)"
           test -n "$CLANG"
           "$CLANG" --version
-          echo "Requested module path: $MODULE_PATH"
-          if [[ "$MODULE_PATH" == *.ko ]]; then
-            test -f "$MODULE_PATH"
+          echo "Requested module path: ${MODULE_PATH:-<EMPTY: no-argument probe>}"
+          if [[ -n "$MODULE_PATH" ]]; then
+            if [[ "$MODULE_PATH" == *.ko ]]; then
+              test -f "$MODULE_PATH"
+            else
+              test -d "$MODULE_PATH"
+            fi
           else
-            test -d "$MODULE_PATH"
+            echo "Probe mode: invoke helper with pineapple gki and closed stdin; no module path supplied."
           fi
           {
             echo "Manifest: OnePlusOSS/kernel_manifest"
@@ -110,7 +114,7 @@ jobs:
             echo "Manifest file: oneplus_12_v.xml"
             echo "Target: pineapple gki"
             echo "Build script: kernel_platform/oplus/build/oplus_build_module.sh"
-            echo "Module path: $MODULE_PATH"
+            echo "Module path: ${MODULE_PATH:-<EMPTY - no-argument probe>}"
             echo "Pinned Clang: r487747c"
             echo
             repo manifest -r
@@ -125,7 +129,15 @@ jobs:
           set -euxo pipefail
           SCRIPT="./kernel_platform/oplus/build/oplus_build_module.sh"
           test -f "$SCRIPT"
-          printf '%s\n' "$MODULE_PATH" | bash "$SCRIPT" pineapple gki 2>&1 | tee ../audit/module-build.log
+          if [[ -n "$MODULE_PATH" ]]; then
+            printf '%s\n' "$MODULE_PATH" | bash "$SCRIPT" pineapple gki 2>&1 | tee ../audit/module-build.log
+          else
+            set +e
+            bash "$SCRIPT" pineapple gki </dev/null 2>&1 | tee ../audit/module-build.log
+            status=${PIPESTATUS[0]}
+            echo "NO_ARGUMENT_PROBE_EXIT_CODE=$status" | tee -a ../audit/module-build.log
+            echo "No-argument probe completed; a non-zero exit is recorded for diagnosis."
+          fi
 
       - name: Verify and collect module outputs
         if: always()
@@ -149,8 +161,12 @@ jobs:
           KO_COUNT="$(find ../audit/module-artifacts -type f -name '*.ko' | wc -l)"
           echo "Collected KO count: $KO_COUNT"
           if [ "$KO_COUNT" -eq 0 ]; then
-            echo "ERROR: no .ko output was produced or collected."
-            exit 1
+            if [ -z "$MODULE_PATH" ]; then
+              echo "No-argument probe: zero KO output is expected; inspect the captured prompt/exit code."
+            else
+              echo "ERROR: no .ko output was produced or collected."
+              exit 1
+            fi
           fi
 
       - name: Upload OPLUS module build outputs
