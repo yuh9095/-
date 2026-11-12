@@ -129,7 +129,7 @@ report += [
     "- NO_BUILT_KO_OR_MODULES_ORDER_ENTRY is a source-inventory warning, not proof that the driver source is absent. A source tree may require configuration and a build to generate modules.order or .ko files.",
     "- CRC comparison is meaningful only when Module.symvers belongs to the exact kernel configuration/build ABI used for the OTA.",
     "- A matching filename does not prove identical module contents. Compare vermagic, imported symbol CRCs, signer and srcversion as well.",
-    "- This workflow audits vendor_dlkm and system_dlkm EROFS contents. vendor_boot ramdisk modules require a separate ramdisk unpack step.",
+    "- This workflow audits vendor_dlkm and system_dlkm EROFS contents and attempts to unpack vendor_boot ramdisk fragments. If a ramdisk compression format is unsupported, its modules will not appear in the extracted inventory.",
     "", "See module-comparison.csv for per-module details."
 ]
 (OUT / "SUMMARY.md").write_text("\n".join(report) + "\n")
