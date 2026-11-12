@@ -1,0 +1,155 @@
+name: Build OnePlus 12 SM8650 GKI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oneplus12-sm8650-gki-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+
+      - name: Checkout audit repository
+        uses: actions/checkout@v4
+        with:
+          path: audit
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl python3 python-is-python3 \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev \
+            zip unzip rsync cpio \
+            device-tree-compiler zstd lz4
+
+      - name: Install repo tool
+        run: |
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o repo
+          chmod +x repo
+          sudo install repo /usr/local/bin/repo
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "OnePlus Kernel Build"
+          git config --global user.email "kernel-build@users.noreply.github.com"
+
+      - name: Sync official OnePlus 12 source
+        run: |
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          repo init \
+            -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b oneplus/sm8650 \
+            -m oneplus_12_v.xml \
+            --depth=1
+
+          repo sync -c --no-tags -j2 --fail-fast
+
+      - name: Verify pinned source and Clang
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          grep -Fx 'CLANG_VERSION=r487747c' \
+            kernel_platform/msm-kernel/build.config.constants
+
+          CLANG="$(find kernel_platform/prebuilts/clang/host/linux-x86 \
+            -type f -path '*/clang-r487747c/bin/clang' -print -quit)"
+
+          test -n "$CLANG"
+          "$CLANG" --version
+
+          {
+            echo "Manifest: OnePlusOSS/kernel_manifest"
+            echo "Manifest branch: oneplus/sm8650"
+            echo "Manifest file: oneplus_12_v.xml"
+            echo "Target: pineapple gki"
+            echo "Pinned Clang: r487747c"
+            echo
+            repo manifest -r
+            echo
+            repo forall -c 'printf "%s %s %s\\n" "$REPO_PATH" "$REPO_PROJECT" "$(git rev-parse HEAD)"'
+          } > ../audit/build-metadata.txt
+
+          echo "Verified official source manifest and pinned compiler."
+
+      - name: Build stock OnePlus 12 GKI
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set -o pipefail
+
+          BUILD_SCRIPT="$(find . -type f -name oplus_build_kernel.sh -print -quit)"
+          if [ -z "$BUILD_SCRIPT" ]; then
+            echo "ERROR: oplus_build_kernel.sh was not found in the synced manifest."
+            find . -maxdepth 5 -type f -iname '*build*kernel*.sh' -print
+            exit 1
+          fi
+
+          echo "Using build script: $BUILD_SCRIPT"
+          bash "$BUILD_SCRIPT" pineapple gki 2>&1 | tee ../audit/build.log
+
+      - name: Collect kernel outputs for OTA comparison
+        if: always()
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set +e
+          mkdir -p ../audit/kernel-artifacts
+
+          find . -type f \( \
+            -name Image -o \
+            -name Image.gz -o \
+            -name '*.ko' -o \
+            -name Module.symvers -o \
+            -name modules.order -o \
+            -name modules.builtin -o \
+            -name modules.builtin.modinfo -o \
+            -name .config -o \
+            -name '*.dtb' -o \
+            -name '*.dtbo' \
+          \) -print0 | while IFS= read -r -d '' file; do
+            mkdir -p "../audit/kernel-artifacts/$(dirname "$file")"
+            cp -a "$file" "../audit/kernel-artifacts/$file"
+          done
+
+          find . -type f \( -name '*.log' -o -name 'build.log' \) -print
+          cp ../audit/build.log ../audit/kernel-artifacts/ 2>/dev/null || true
+          cp ../audit/build-metadata.txt ../audit/kernel-artifacts/ 2>/dev/null || true
+
+          du -sh ../audit/kernel-artifacts 2>/dev/null || true
+          find ../audit/kernel-artifacts -type f | wc -l
+
+      - name: Upload build log and comparison inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePlus12-SM8650-GKI-OTA-Comparison-Inputs
+          path: |
+            audit/build.log
+            audit/build-metadata.txt
+            audit/kernel-artifacts/
+          if-no-files-found: warn
+          compression-level: 1
+          retention-days: 14
